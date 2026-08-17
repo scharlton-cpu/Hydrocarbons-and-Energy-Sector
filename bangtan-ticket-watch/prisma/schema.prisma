@@ -1,0 +1,314 @@
+// Production database schema for Bangtan Ticket Watch.
+//
+// NOTE ON CURRENT RUNTIME STATE:
+// The MVP shipped in this repo runs on an in-memory demo data layer
+// (see src/lib/demo-data + src/lib/data-access) so the app is usable with
+// zero infrastructure setup. This schema is the real target: point
+// DATABASE_URL at a Postgres instance (Supabase or otherwise), run
+// `npx prisma migrate dev`, and swap the data-access layer's implementation
+// to the Prisma client — the function signatures in src/lib/data-access are
+// intentionally already shaped around these tables so that swap is
+// mechanical, not a rewrite.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity / catalog hierarchy: Artist -> Tour -> City -> Venue -> Event
+// ---------------------------------------------------------------------------
+
+model Artist {
+  id    String @id @default(cuid())
+  slug  String @unique
+  name  String
+  tours Tour[]
+
+  @@map("artists")
+}
+
+model Tour {
+  id       String @id @default(cuid())
+  artistId String
+  artist   Artist @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  slug     String
+  name     String
+  cities   City[]
+
+  @@unique([artistId, slug])
+  @@index([artistId])
+  @@map("tours")
+}
+
+model City {
+  id       String  @id @default(cuid())
+  tourId   String
+  tour     Tour    @relation(fields: [tourId], references: [id], onDelete: Cascade)
+  slug     String
+  name     String
+  country  String
+  timezone String
+  venues   Venue[]
+  watches  Watch[]
+
+  @@unique([tourId, slug])
+  @@index([tourId])
+  @@map("cities")
+}
+
+model Venue {
+  id        String         @id @default(cuid())
+  cityId    String
+  city      City           @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  name      String
+  address   String?
+  seatZones SeatZone[]
+  events    ConcertEvent[]
+
+  @@index([cityId])
+  @@map("venues")
+}
+
+/// Venue-specific seating zone. Every venue defines its own set — never assumed shared.
+model SeatZone {
+  id       String           @id @default(cuid())
+  venueId  String
+  venue    Venue            @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  name     String // e.g. "Floor A", "Section 101"
+  category SeatZoneCategory
+  listings Listing[]
+
+  @@unique([venueId, name])
+  @@index([venueId])
+  @@map("seat_zones")
+}
+
+enum SeatZoneCategory {
+  floor
+  lower_bowl
+  club
+  upper_level
+  other
+}
+
+model ConcertEvent {
+  id             String          @id @default(cuid())
+  venueId        String
+  venue          Venue           @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  date           DateTime
+  doorsTime      DateTime?
+  currency       String          @default("USD")
+  providerEvents ProviderEvent[]
+  listings       Listing[]
+  watchEvents    WatchEvent[]
+
+  @@index([venueId, date])
+  @@map("concert_events")
+}
+
+// ---------------------------------------------------------------------------
+// Marketplace layer: Provider -> ProviderEvent -> Listing -> PriceSnapshot
+// ---------------------------------------------------------------------------
+
+model Provider {
+  id             String          @id // "tickpick" | "stubhub" | "seatgeek"
+  name           String
+  enabled        Boolean         @default(true)
+  baseListingUrl String
+  providerEvents ProviderEvent[]
+  listings       Listing[]
+
+  @@map("providers")
+}
+
+/// A marketplace's own record of an event, prior to listing normalization.
+model ProviderEvent {
+  id              String       @id @default(cuid())
+  providerId      String
+  provider        Provider     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  concertEventId  String
+  concertEvent    ConcertEvent @relation(fields: [concertEventId], references: [id], onDelete: Cascade)
+  providerEventId String // the marketplace's own event identifier
+  lastSyncedAt    DateTime?
+  lastSyncStatus  String       @default("ok") // ok | error | unavailable
+  lastSyncError   String?
+
+  @@unique([providerId, concertEventId])
+  @@index([concertEventId])
+  @@map("provider_events")
+}
+
+/// Normalized listing — every provider adapter maps its raw response onto this shape.
+model Listing {
+  id                String          @id @default(cuid())
+  providerId        String
+  provider          Provider        @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  providerListingId String // id on the marketplace's own system
+  concertEventId    String
+  concertEvent      ConcertEvent    @relation(fields: [concertEventId], references: [id], onDelete: Cascade)
+  seatZoneId        String
+  seatZone          SeatZone        @relation(fields: [seatZoneId], references: [id], onDelete: Cascade)
+  section           String
+  row               String?
+  seatNumbers       String?
+  quantity          Int
+  basePrice         Decimal         @db.Decimal(10, 2)
+  fees              Decimal         @db.Decimal(10, 2)
+  allInPrice        Decimal         @db.Decimal(10, 2)
+  currency          String
+  listingUrl        String
+  available         Boolean         @default(true)
+  firstSeenAt       DateTime        @default(now())
+  lastSeenAt        DateTime        @default(now())
+  lastPriceChangeAt DateTime        @default(now())
+  priceSnapshots    PriceSnapshot[]
+  favorites         Favorite[]
+
+  @@unique([providerId, providerListingId])
+  @@index([concertEventId, available])
+  @@index([seatZoneId])
+  @@index([concertEventId, allInPrice])
+  @@map("listings")
+}
+
+/// Periodic price snapshot. High write/read volume — indexed for time-series queries.
+model PriceSnapshot {
+  id         String   @id @default(cuid())
+  listingId  String
+  listing    Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  price      Decimal  @db.Decimal(10, 2)
+  allInPrice Decimal  @db.Decimal(10, 2)
+  available  Boolean
+  capturedAt DateTime @default(now())
+
+  @@index([listingId, capturedAt])
+  @@map("price_snapshots")
+}
+
+// ---------------------------------------------------------------------------
+// User layer: watches, alerts, favorites, notifications
+// ---------------------------------------------------------------------------
+
+model User {
+  id         String      @id @default(cuid())
+  email      String      @unique
+  createdAt  DateTime    @default(now())
+  watches    Watch[]
+  alertRules AlertRule[]
+  favorites  Favorite[]
+
+  @@map("users")
+}
+
+model Watch {
+  id                 String             @id @default(cuid())
+  userId             String
+  user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name               String
+  cityId             String
+  city               City               @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  seatZoneCategories SeatZoneCategory[]
+  quantity           Int                @default(1)
+  maxPrice           Decimal            @db.Decimal(10, 2)
+  currency           String
+  status             WatchStatus        @default(active)
+  createdAt          DateTime           @default(now())
+  watchEvents        WatchEvent[]
+  alertRules         AlertRule[]
+
+  @@index([userId, status])
+  @@map("watches")
+}
+
+enum WatchStatus {
+  active
+  paused
+  deleted
+}
+
+/// Join table: a Watch can target specific concert dates, or all dates in the city.
+model WatchEvent {
+  id             String       @id @default(cuid())
+  watchId        String
+  watch          Watch        @relation(fields: [watchId], references: [id], onDelete: Cascade)
+  concertEventId String
+  concertEvent   ConcertEvent @relation(fields: [concertEventId], references: [id], onDelete: Cascade)
+
+  @@unique([watchId, concertEventId])
+  @@map("watch_events")
+}
+
+model AlertRule {
+  id               String            @id @default(cuid())
+  userId           String
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  watchId          String?
+  watch            Watch?            @relation(fields: [watchId], references: [id], onDelete: SetNull)
+  type             AlertRuleType
+  cityId           String?
+  concertEventId   String?
+  seatZoneCategory SeatZoneCategory?
+  thresholdPrice   Decimal?          @db.Decimal(10, 2)
+  thresholdPercent Decimal?          @db.Decimal(5, 2)
+  active           Boolean           @default(true)
+  createdAt        DateTime          @default(now())
+  alertEvents      AlertEvent[]
+
+  @@index([userId, active])
+  @@map("alert_rules")
+}
+
+enum AlertRuleType {
+  price_below
+  zone_price_below
+  percent_drop
+  new_listing_below
+  inventory_spike
+  below_comparable_pct
+}
+
+model AlertEvent {
+  id               String            @id @default(cuid())
+  ruleId           String
+  rule             AlertRule         @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  listingId        String?
+  message          String
+  triggeredAt      DateTime          @default(now())
+  read             Boolean           @default(false)
+  notificationLogs NotificationLog[]
+
+  @@index([ruleId, triggeredAt])
+  @@map("alert_events")
+}
+
+model Favorite {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  listingId      String
+  listing        Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  priceWhenSaved Decimal  @db.Decimal(10, 2)
+  currency       String
+  savedAt        DateTime @default(now())
+  stillAvailable Boolean  @default(true)
+
+  @@unique([userId, listingId])
+  @@map("favorites")
+}
+
+model NotificationLog {
+  id           String     @id @default(cuid())
+  alertEventId String
+  alertEvent   AlertEvent @relation(fields: [alertEventId], references: [id], onDelete: Cascade)
+  channel      String // in_app | email | sms | push | whatsapp | telegram
+  sentAt       DateTime   @default(now())
+  status       String // sent | failed | skipped_not_configured
+
+  @@index([alertEventId])
+  @@map("notification_logs")
+}
